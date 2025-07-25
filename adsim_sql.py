@@ -1759,6 +1759,57 @@ def main():
         
         # Create a cursor
         cursor = conn.cursor()
+        
+        # New Feature: Sync users from Google Sheet, checking if there's any new user not present in DB (public.users)
+        try:
+            log_operation("Starting user sync from Google Sheet.", "info")
+            
+            # 1. Login to Google Sheets
+            gc = login()
+            
+            # 2. Fetch data from Google Sheet
+            spreadsheet_url = "https://docs.google.com/spreadsheets/d/1W_4JFszD1hfYjD9P-3oNL02a10kK-nMCR2ELNptR1Vc/edit?gid=0#gid=0"
+            sheet = gc.open_by_url(spreadsheet_url)
+            worksheet = sheet.get_worksheet(0)  # Getting first sheet
+            sheet_data = worksheet.get_all_records()
+            sheet_users_df = pd.DataFrame(sheet_data)
+
+            # Cleaning to get only users with user_id
+            sheet_users_df.dropna(subset=['user_id'], inplace=True)
+            sheet_users_df = sheet_users_df[sheet_users_df['user_id'] != '']
+            
+            # Ensure sheet dataframe has the right columns and types
+            sheet_users_df = ensure_columns(sheet_users_df, expected_columns['users'], drop_extra_columns=True)
+            sheet_users_df = convert_columns_to_int(sheet_users_df, ['user_id', 'equipe_id'])
+            sheet_users_df.columns = sheet_users_df.columns.str.lower()
+
+            log_operation(f"Successfully fetched {len(sheet_users_df)} users from Google Sheet.", "success")
+
+            # 3. Fetch existing user IDs from the database
+            db_users_df = pd.read_sql_query("SELECT user_id FROM public.users", engine)
+            
+            # 4. Identify new users
+            if not db_users_df.empty:
+                existing_user_ids = set(db_users_df['user_id'])
+                new_users_df = sheet_users_df[~sheet_users_df['user_id'].isin(existing_user_ids)].copy()
+            else:
+                new_users_df = sheet_users_df.copy()
+
+            # 5. Insert new users into the database
+            if not new_users_df.empty:
+                log_operation(f"Found {len(new_users_df)} new users to insert from Google Sheet.", "info")
+                empty_update_df = pd.DataFrame(columns=new_users_df.columns)
+                user_columns_to_check = [col for col in expected_columns['users'] if col != 'user_id']
+                
+                update_or_insert_rows(conn, cursor, "users", "user_id", user_columns_to_check, empty_update_df, new_users_df)
+                log_operation(f"Finished inserting new users from Google Sheet.", "success")
+            else:
+                log_operation("No new users to insert from Google Sheet.", "info")
+
+        except Exception as e:
+            log_error_report(e)
+            log_operation("User sync from Google Sheet failed.", "failed", str(e))
+        # End of New Block
 
         table_mappings = {
         "teams": ("equipe_id", ['equipe_name'], matriz_equipes),
@@ -1799,30 +1850,48 @@ def main():
         "activities" : ("activity_id", ['main_id', 'organization_id', 'person_id', 'company_id', 'user_id', 'startdate', 'enddate', 'donedate', 'isdone', 
                                         'isallday', 'title', 'notes', 'checkin_date', 'checkin_latitude', 'checkin_longitude', 'type_id'], activities)
         }
+        
+        # New function to compare database with google sheet and delete missing rows
+        def delete_missing_rows_from_db(conn, cursor, table_name, id_column, new_ids):
+            """
+            Deletes rows from the database table that are not present in the new_ids list.
+            This is used to ensure the database matches the source of truth (e.g., Google Sheet).
+            """
+            db_ids = pd.read_sql_query(f"SELECT {id_column} FROM {table_name}", conn)[id_column]
+            db_ids_set = set(db_ids)
+            new_ids_set = set(new_ids)
+            ids_to_delete = db_ids_set - new_ids_set
+            if ids_to_delete:
+                placeholders = ', '.join(['%s'] * len(ids_to_delete))
+                delete_sql = f"DELETE FROM {table_name} WHERE {id_column} IN ({placeholders})"
+                cursor.execute(delete_sql, tuple(ids_to_delete))
+                conn.commit()
+                log_operation(f"Deleted {len(ids_to_delete)} rows from {table_name} that were removed from the Google Sheet.", "success")
 
         for table_name, (id_column, columns_to_check, new_data_df) in table_mappings.items():
             try:
-                # Check if the new data DataFrame is not empty and the ID column exists
-                if not new_data_df.empty and id_column in new_data_df.columns:
-                    # Get unique, non-null IDs from the new data
-                    ids_to_fetch = new_data_df[id_column].dropna().unique().tolist()
-
-                    # If there are IDs to fetch, query only those rows
-                    if ids_to_fetch:
-                        # Use placeholders for security and efficiency
-                        placeholders = ', '.join(['%s'] * len(ids_to_fetch))
-                        sql_query = f"SELECT * FROM {table_name} WHERE {id_column} IN ({placeholders})"
-                        # Pass the list of IDs as parameters
-                        sql_data = pd.read_sql_query(sql_query, engine, params=tuple(ids_to_fetch))
-                        log_operation(f"Fetched {len(sql_data)} specific rows from {table_name} based on new data IDs.", "success")
-                    else:
-                        # No valid IDs in new data, fetch empty structure from DB
-                        log_operation(f"No valid IDs found in new data for {table_name}. Fetching empty structure.", "info")
-                        sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
+                # For the sales table, fetch all rows to ensure deletions work correctly
+                if table_name == "sales":
+                    sql_data = pd.read_sql_query(f"SELECT * FROM {table_name}", engine)
+                    # Ensure DB matches sheet: delete any sales not present in the latest sheet
+                    if not new_data_df.empty and id_column in new_data_df.columns:
+                        new_ids = new_data_df[id_column].dropna().unique().tolist()
+                        delete_missing_rows_from_db(conn, cursor, table_name, id_column, new_ids)
                 else:
-                    # New data is empty or ID column missing, fetch empty structure
-                    log_operation(f"New data for {table_name} is empty or missing ID column '{id_column}'. Fetching empty structure.", "info")
-                    sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
+                    # Existing logic for other tables
+                    if not new_data_df.empty and id_column in new_data_df.columns:
+                        ids_to_fetch = new_data_df[id_column].dropna().unique().tolist()
+                        if ids_to_fetch:
+                            placeholders = ', '.join(['%s'] * len(ids_to_fetch))
+                            sql_query = f"SELECT * FROM {table_name} WHERE {id_column} IN ({placeholders})"
+                            sql_data = pd.read_sql_query(sql_query, engine, params=tuple(ids_to_fetch))
+                            log_operation(f"Fetched {len(sql_data)} specific rows from {table_name} based on new data IDs.", "success")
+                        else:
+                            log_operation(f"No valid IDs found in new data for {table_name}. Fetching empty structure.", "info")
+                            sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
+                    else:
+                        log_operation(f"New data for {table_name} is empty or missing ID column '{id_column}'. Fetching empty structure.", "info")
+                        sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
 
                 # Proceed with comparison and update
                 compare_and_update_table(cursor, conn, table_name, id_column, columns_to_check, sql_data, new_data_df)
