@@ -12,6 +12,8 @@ import logging
 import traceback
 import smtplib
 import gspread
+import hashlib
+import unicodedata
 from concurrent import futures
 from sqlalchemy import create_engine
 from google.oauth2 import service_account
@@ -39,6 +41,30 @@ report = {
     "errors": [],
     "warning": []
 }
+
+def send_error_email(subject, message):
+    # Email configuration
+    smtp_server = "smtp.gmail.com"
+    smtp_port = 587
+    smtp_user = "marcosaurelio.irenos@gmail.com"
+    smtp_password = "iafvtsmbvcuhcddt"
+    recipient = "marcos.irenos@gruporic.com.br"
+    try:
+        # Create the email
+        msg = MIMEMultipart()
+        msg['From'] = smtp_user
+        msg['To'] = recipient
+        msg['Subject'] = subject
+        msg.attach(MIMEText(message, 'plain'))
+
+        # Send the email
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        logging.info("Error email sent successfully.")
+    except Exception as e:
+        logging.error(f"Failed to send error email: {e}")
 
 def log_operation(operation, status, details=None):
     report["operations"].append({
@@ -87,6 +113,8 @@ def save_report(report):
     with open(file_path, "w") as f:
         json.dump(report, f, indent=4)
     
+    send_error_email(f"Error in ETL run at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", "Check report")
+    
     logging.info(f"Report saved to {file_path}")
 
 end = datetime.today()
@@ -99,11 +127,13 @@ start = end - timedelta(minutes=45)
 start_date = start.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 logs_start_str = start.strftime("%Y-%m-%d")
 
-deals_url = f"https://api.adsim.co/crm-r/api/v2/deals?start={start_date}&end={end_date}"
-logs_url = f'https://api.adsim.co/crm-r/api/v2/deals/steps/logs?enterDateStart={logs_end_str}'
-proposals_url = f'https://api.adsim.co/crm-r/api/v2/deals/proposals?start={start_date}&end={end_date}'
-organization_url = f"https://api.adsim.co/crm-r/api/v2/entities?start={start_date}&end={end_date}"
-activities_url = f"https://api.adsim.co/crm-r/api/v2/activity?start={start_date}"
+endpoints = [
+	f'https://api.adsim.co/crm-r/api/v2/deals?start={start_date}&end={end_date}',
+	f'https://api.adsim.co/crm-r/api/v2/deals/steps/logs?enterDateStart={logs_end_str}',
+	f'https://api.adsim.co/crm-r/api/v2/deals/proposals?start={start_date}&end={end_date}',
+	f'https://api.adsim.co/crm-r/api/v2/entities?start={start_date}&end={end_date}',
+	f'https://api.adsim.co/crm-r/api/v2/activity?start={start_date}'	
+]
 
 headers = {
     "authorization" : f"Bearer {adsim_token}",
@@ -187,8 +217,11 @@ def find_differences(df1, df2, id_column, columns_to_check):
     # Log columns after the merge
     print(f"Columns in merged DataFrame: {merged.columns.tolist()}")
 
-    # Identify rows with changes
-    rows_with_changes_mask = merged[id_column].notna()
+    # Identify rows eligible for update (IDs existing in both datasets)
+    df1_ids = set(df1[id_column].dropna().tolist()) if id_column in df1.columns else set()
+    df2_ids = set(df2[id_column].dropna().tolist()) if id_column in df2.columns else set()
+    common_ids = df1_ids.intersection(df2_ids)
+    rows_with_changes_mask = merged[id_column].isin(common_ids)
 
     # Create a list to store information about rows to update
     rows_to_update = []
@@ -239,6 +272,14 @@ def update_or_insert_rows(conn, cursor, table_name, id_column, columns_to_check,
     """
     Updates or inserts rows in a database table, with enhanced error tracking.
     """
+    def _pg_safe(value):
+        """Convert numpy scalar types to builtin Python types for psycopg2."""
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            return float(value)
+        return value
+
     if not isinstance(rows_to_update, pd.DataFrame):
         log_operation(f"rows_to_update is not a DataFrame. It is a {type(rows_to_update)}", "warning")
         return
@@ -257,79 +298,82 @@ def update_or_insert_rows(conn, cursor, table_name, id_column, columns_to_check,
     start_time = time.time()
 
     # Update Logic
-    if table_name != "historico":
-        if not rows_to_update.empty:
-            if id_column not in rows_to_update.columns:
-                log_operation(f"id_column {id_column} not found in rows_to_update", "warning")
-                return
+    if not rows_to_update.empty:
+        if id_column not in rows_to_update.columns:
+            log_operation(f"id_column {id_column} not found in rows_to_update", "warning")
+            return
 
-            log_operation(f"Attempting to update rows in {table_name}.", "info")
+        log_operation(f"Attempting to update rows in {table_name}.", "info")
 
-            try:
-                update_count = 0
-                for index, row in rows_to_update.iterrows():
-                    set_clauses = []
-                    values = []
-                    problematic_columns = []
-                    skipped_count = 0
+        try:
+            update_count = 0
+            for index, row in rows_to_update.iterrows():
+                set_clauses = []
+                values = []
+                problematic_columns = []
+                skipped_count = 0
 
-                    for col in columns_to_check:
-                        if col in row:
-                            if row[col] is None or row[col] == "" or (isinstance(row[col], (int, float)) and pd.isna(row[col])) or pd.isna(row[col]):
-                                skipped_count +=1
-                                continue
+                for col in columns_to_check:
+                    if col in row:
+                        if row[col] is None or row[col] == "" or (isinstance(row[col], (int, float)) and pd.isna(row[col])) or pd.isna(row[col]):
+                            skipped_count +=1
+                            continue
                             
-                            if isinstance(row[col], (int, float)) and not pd.isna(row[col]):
-                                if not (-9223372036854775808 <= row[col] <= 9223372036854775807):
-                                    problematic_columns.append((col, row[col]))
-                                    log_operation(
-                                        f"Value out of range for bigint in column '{col}' during update in table '{table_name}' (ID: {row[id_column]}), Value: {row[col]}",
-                                        "warning"
-                                    )
-                                    continue
-
-                            # Handle date/datetime columns
-                            if isinstance(row[col], pd.Timestamp):
-                                values.append(row[col].to_pydatetime())
-                            elif isinstance(row[col], date):
-                                values.append(row[col])
-                            else:
-                                values.append(row[col])
-
+                        if isinstance(row[col], (int, float, np.integer, np.floating)) and not pd.isna(row[col]):
+                            converted_numeric = _pg_safe(row[col])
+                            if not (-9223372036854775808 <= converted_numeric <= 9223372036854775807):
+                                problematic_columns.append((col, row[col]))
+                                log_operation(
+                                    f"Value out of range for bigint in column '{col}' during update in table '{table_name}' (ID: {row[id_column]}), Value: {row[col]}",
+                                    "warning"
+                                )
+                                continue
+                            values.append(converted_numeric)
                             set_clauses.append(f"{col} = %s")
+                            continue
 
-                    if not set_clauses:
-                        log_operation(f"No columns to update for row {row[id_column]} in {table_name} after skipping empty values.", "warning")
-                        continue
+                        # Handle date/datetime columns
+                        if isinstance(row[col], pd.Timestamp):
+                            values.append(row[col].to_pydatetime())
+                        elif isinstance(row[col], date):
+                            values.append(row[col])
+                        else:
+                            values.append(_pg_safe(row[col]))
+
+                        set_clauses.append(f"{col} = %s")
+
+                if not set_clauses:
+                    log_operation(f"No columns to update for row {row[id_column]} in {table_name} after skipping empty values.", "warning")
+                    continue
                     
-                    if problematic_columns:
-                        log_operation(f"Skipping row update (ID: {row[id_column]}) in table '{table_name}' due to values out of range in columns: {problematic_columns}", "warning")
-                        continue
+                if problematic_columns:
+                    log_operation(f"Skipping row update (ID: {row[id_column]}) in table '{table_name}' due to values out of range in columns: {problematic_columns}", "warning")
+                    continue
 
-                    set_clause = ", ".join(set_clauses)
-                    values.append(row[id_column])
-                    sql_update = f"UPDATE {table_name} SET {set_clause} WHERE {id_column} = %s"
+                set_clause = ", ".join(set_clauses)
                     
-                    try:
-                        cursor.execute(sql_update, values)
-                        update_count += 1
-                    except Exception as e:
-                        conn.rollback()
-                        log_error_report(e)
-                        log_operation(f"failed to update data into {table_name} for row: {row[id_column]}", "failed", str(e))
+                values.append(_pg_safe(row[id_column]))
+                sql_update = f"UPDATE {table_name} SET {set_clause} WHERE {id_column} = %s"
+                    
+                try:
+                    cursor.execute(sql_update, values)
+                    update_count += 1
+                except Exception as e:
+                    conn.rollback()
+                    log_error_report(e)
+                    log_operation(f"failed to update data into {table_name} for row: {row[id_column]}", "failed", str(e))
 
-                conn.commit()
-                log_operation(f"Successfully updated {update_count} rows in {table_name}.", "success")
+            conn.commit()
+            log_operation(f"Successfully updated {update_count} rows in {table_name}.", "success")
 
-            except Exception as e:
-                conn.rollback()
-                log_error_report(e)
-                log_operation(f"failed to update data into {table_name}", "failed", str(e))
+        except Exception as e:
+            conn.rollback()
+            log_error_report(e)
+            log_operation(f"failed to update data into {table_name}", "failed", str(e))
 
-            log_operation(f"Update operations for table {table_name} completed.", "success")
+        log_operation(f"Update operations for table {table_name} completed.", "success")
     
-    else: 
-        log_operation(f"Skipping update operations for table {table_name} as requested.", "warning")
+
 
     # Insert Logic (improved NaN/NaT handling)
     if not rows_to_insert.empty:           
@@ -358,22 +402,23 @@ def update_or_insert_rows(conn, cursor, table_name, id_column, columns_to_check,
                         values.append(None) # Treat as null
                         continue
 
-                    if isinstance(row[col], (int, float)):
-                        if not (-9223372036854775808 <= row[col] <= 9223372036854775807):
+                    if isinstance(row[col], (int, float, np.integer, np.floating)):
+                        converted_numeric = _pg_safe(row[col])
+                        if not (-9223372036854775808 <= converted_numeric <= 9223372036854775807):
                             row_problematic_columns.append((col, row[col]))
                             log_operation(
                                 f"Value out of range for bigint in column '{col}' during insert in table '{table_name}' (ID: {row[id_column]}), Value: {row[col]}",
                                 "warning"
                             )
                             continue
-                        values.append(row[col])
+                        values.append(converted_numeric)
 
                     elif isinstance(row[col], pd.Timestamp):
                         values.append(row[col].to_pydatetime())
                     elif isinstance(row[col], date):
                         values.append(row[col])
                     else:
-                        values.append(row[col])
+                        values.append(_pg_safe(row[col]))
 
                 if row_problematic_columns:
                     problematic_rows.append((row[id_column], row_problematic_columns))
@@ -452,6 +497,7 @@ def extract_adsim_data(url, max_retries=3, timeout_seconds=30, retry_delay_secon
                     except json.JSONDecodeError as e:
                         print(f"JSONDecodeError on line: {line}")
                         print(e)
+                        send_error_email("Erro em código ETL AdSim", e)
                         log_warning_report(f"JSONDecodeError while parsing API response from {url}", f"Line: {line}, Error: {e}")
 
 
@@ -465,6 +511,7 @@ def extract_adsim_data(url, max_retries=3, timeout_seconds=30, retry_delay_secon
             if attempt < max_retries - 1:
                 time.sleep(retry_delay_seconds)
             else:
+                send_error_email("Erro em código ETL AdSim", e)
                 log_error_report(TimeoutError(f"Failed to fetch data from {url} after {max_retries} attempts due to timeout."))
                 return pd.DataFrame() # Return empty DataFrame after max retries
 
@@ -474,11 +521,13 @@ def extract_adsim_data(url, max_retries=3, timeout_seconds=30, retry_delay_secon
             if attempt < max_retries - 1:
                 time.sleep(retry_delay_seconds)
             else:
+                send_error_email("Erro em código ETL AdSim", e)
                 log_error_report(e) # Log final error
                 return pd.DataFrame() # Return empty DataFrame after max retries
         
         except Exception as e: # Catch any other unexpected errors
             log_error_report(e)
+            send_error_email("Erro em código ETL AdSim", "An unexpected error occurred while fetching data from AdSim API.")
             log_operation(f"An unexpected error occurred while fetching data from {url} (attempt {attempt + 1}/{max_retries})", "failed", str(e))
             if attempt < max_retries - 1:
                 time.sleep(retry_delay_seconds)
@@ -804,7 +853,7 @@ def safe_merge(df1, df2, id_column, columns_to_merge, merge_type='inner'):
     """
     # Check if id_column exists in both DataFrames
     if id_column not in df1.columns or id_column not in df2.columns:
-        log_operation(f"Column '{id_column}' not found in one or both DataFrames.", "failed")
+        log_operation(f"Column '{id_column}' not found, check dataframes columns:\nDf1: {df1.columns}\nDf2: {df2.columns}.", "failed")
         return df1  # Return the original DataFrame if the merge key is missing
 
     # Check if id_column is unique in df2
@@ -832,11 +881,18 @@ def safe_merge(df1, df2, id_column, columns_to_merge, merge_type='inner'):
         return df1  # Return the original DataFrame if an error occurs
 
 def main():
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        api_response = executor.map(extract_adsim_data, endpoints)
+        
+    dataframes = list(api_response)
+    dues_display_locations = pd.DataFrame(columns=['displayLocation_id', 'displayLocation_name', 'displayLocation_initials'])
+ 
     #deals table block
     try:
-        df = extract_adsim_data(deals_url)
+        df = dataframes[0]
         df = ensure_columns(df, needed_columns['deals'],drop_extra_columns=False)
         df = df.rename(columns={'id': 'main_id'})
+
 
         df['registerDate'] = pd.to_datetime(df['registerDate'], errors='coerce')
         df['lastUpdateDate'] = pd.to_datetime(df['lastUpdateDate'], errors='coerce')
@@ -884,7 +940,6 @@ def main():
         users = users.drop_duplicates(subset=['id'])
         users = drop_columns(users, columns_to_drop=['users'])
         users = users.rename(columns={'id': 'user_id'})
-
         del creatorUser, responsibleUser
 
         log_operation("users dataframe created successfully!", "success")
@@ -922,7 +977,6 @@ def main():
 
         company = company.rename(columns={'id': 'company_id'})
         company = company.drop_duplicates(subset=['company_id'])
-
         company.head()
         log_operation("pipelineStep dataframe created successfully!", "success")
     except Exception as e:
@@ -936,7 +990,7 @@ def main():
 
         df['organization_id'] = organization2['id']
 
-        organization = extract_adsim_data(organization_url)
+        organization = dataframes[3]
         organization = ensure_columns(organization, needed_columns['organization'], drop_extra_columns=False)
 
         organization = organization.rename(columns={'id' : 'organization_id'})
@@ -979,13 +1033,12 @@ def main():
         portfolios = pd.json_normalize(portfolios['customerPortfolios'])
         portfolios = ensure_columns(portfolios, needed_columns['portfolios'], drop_extra_columns=False)
         organization['portfolio_id'] = portfolios['id']
-        portfolios = portfolios.rename(columns={'id': 'portfolio_id', 'userEmail' : 'login'})
+        portfolios = portfolios.rename(columns={'id': 'portfolio_id'})
         portfolios = portfolios.dropna(subset=['portfolio_id'])
         portfolios = portfolios.drop_duplicates(subset='portfolio_id')
         portfolios.loc[portfolios['companyId'] == 12.0, 'companyId'] = 782.0
-
-        portfolios = safe_merge(portfolios, users, id_column='user_id', columns_to_merge=['login'], merge_type='left')
         portfolios = drop_columns(portfolios, columns_to_drop=['login', 'userFullName'])
+        portfolios = portfolios.rename(columns={'userEmail' : 'login'})
 
         portfolios['registerDate'] = pd.to_datetime(portfolios['registerDate'], errors='coerce')
         portfolios['lastUpdateDate'] = pd.to_datetime(portfolios['lastUpdateDate'], errors='coerce')
@@ -995,12 +1048,24 @@ def main():
         organization = drop_columns(organization, columns_to_drop=['emails','phoneNumbers','company', 'notes', 'specialFields', 'links', 'segments', 'customerPortfolios'])
         organization2 = drop_columns(organization2, columns_to_drop=['emails','phoneNumbers','company_name','company_cnpjCpf', 'company_logoUrl', 'notes', 'specialFields', 'links', 'segments', 'customerPortfolios'])
         organization = pd.concat([organization2,organization], axis=0, ignore_index=True)
-
         organization['registerDate'] = pd.to_datetime(organization['registerDate'], errors='coerce')
         organization['criacao_data'] = organization['registerDate'].dt.date
-
+    
         organization = organization.drop_duplicates(subset=['organization_id'])
         organization = organization.dropna(subset=['organization_id'])
+        
+        try:  
+            organization['stateRegistration'] = (
+                (organization['stateRegistration'].notna()) &
+                (organization['stateRegistration'].str.upper().str.strip().str.contains('S'))
+            )
+            
+            organization['municipalRegistration'] = (
+                (organization['municipalRegistration'].notna()) &
+                (organization['municipalRegistration'].str.upper().str.strip().str.contains('S'))
+            )
+        except Exception as e:
+            log_operation("Warning: Failed to convert stateRegistration or municipalRegistration to bool", "warning", str(e))
 
         del portfolios2, organization2, segments2
 
@@ -1008,15 +1073,24 @@ def main():
     except Exception as e:
         log_error_report(e)
         log_operation("organization, segments, emails, phone dataframes dataframe creation failed!", "failed", str(e))
-
+        
+        
     #products script block
     try:
         products = df.explode('products')[['products']]
         products = pd.json_normalize(products['products'], sep='_')
         products = ensure_columns(products, needed_columns['products'], drop_extra_columns=False)
-
-        df['products_id'] = products['id']
-
+        
+        def extract_id(x):
+            if isinstance(x, list):
+                return x[0].get("id") if x else None
+            if isinstance(x, dict):
+                return x.get("id")
+            return None
+        
+        
+        df["products_id"] = df["products"].apply(extract_id).astype("Int64")
+        print(f"df for id 1465429\n{df[df['main_id'] == 1465429].products_id}")
         products = products.rename(columns={'id' : 'product_id'})
         df = drop_columns(df, columns_to_drop=['products'])
 
@@ -1032,9 +1106,11 @@ def main():
         products = products.dropna(subset=['product_id'])
         products = products.drop_duplicates(subset=['product_id'])
         log_operation("products dataframe created succesfully!", "success")
+        
     except Exception as e:
         log_error_report(e)
         log_operation("products dataframe creation failed!", "failed", str(e))
+        
 
     #dealtype script block
     try:
@@ -1051,9 +1127,11 @@ def main():
 
         dealType.head()        
         log_operation("dealtype dataframe created succesfully!", "success")
+
     except Exception as e:
         log_error_report(e)
         log_operation("dealtype dataframe creation failed!", "failed", str(e))
+        
 
     #dues script block
     try:    
@@ -1063,7 +1141,7 @@ def main():
         # **Error Handling and Debugging:**
         if dues.empty:
           log_operation("dues DataFrame is empty after json_normalize. Skipping column renaming.", "warning")
-          # Continue with the code since it is not critical to stop here
+
         else:
             # Check if columns are strings before applying .str accessor:
             if isinstance(dues.columns, pd.Index) and all(isinstance(col, str) for col in dues.columns):
@@ -1080,6 +1158,36 @@ def main():
               log_operation("dues.columns has been converted to string", "warning")
 
         dues = ensure_columns(dues, needed_columns['dues'], drop_extra_columns=False)
+        
+        capture_columns = ['displayLocation_id', 'displayLocation_name', 'displayLocation_initials']
+        if set(capture_columns).issubset(dues.columns):
+            temp_display_locations = dues[capture_columns].copy()
+            temp_display_locations['displayLocation_id'] = pd.to_numeric(
+                temp_display_locations['displayLocation_id'], errors='coerce'
+            )
+            temp_display_locations = temp_display_locations.dropna(subset=['displayLocation_id'])
+            if not temp_display_locations.empty:
+                temp_display_locations['displayLocation_id'] = temp_display_locations['displayLocation_id'].astype('Int64')
+                temp_display_locations = temp_display_locations.drop_duplicates(subset=['displayLocation_id'])
+                dues_display_locations = pd.concat(
+                    [dues_display_locations, temp_display_locations],
+                    axis=0,
+                    ignore_index=True
+                )
+                dues_display_locations = dues_display_locations.dropna(subset=['displayLocation_id'])
+                dues_display_locations['displayLocation_id'] = pd.to_numeric(
+                    dues_display_locations['displayLocation_id'], errors='coerce'
+                ).astype('Int64')
+                dues_display_locations = dues_display_locations.drop_duplicates(subset=['displayLocation_id'])
+                log_operation(
+                    f"Captured {len(dues_display_locations)} display locations from dues payload.",
+                    "info"
+                )
+        else:
+            log_operation(
+                "Dues payload missing display location metadata columns; falling back to other sources.",
+                "warning"
+            )
 
         df = drop_columns(df, columns_to_drop=['dues'])
 
@@ -1103,10 +1211,16 @@ def main():
         dues['criacao_data'] = dues['registerDate'].dt.date
         dues['atualizacao_data'] = dues['lastUpdateDate'].dt.date
 
-        dues = dues.rename(columns={'id' : 'dues_id', 'userId' : 'user_id', 'companyId' : 'company_id'})
+        dues = dues.rename(columns={
+            'id' : 'dues_id',
+            'companyId' : 'company_id'
+        })
 
         log_operation("dues dataframe created succesfully!", "success")
+
+        
     except Exception as e:
+        send_error_email("Erro em código ETL AdSim", e)
         log_error_report(e)
         log_operation("dues dataframe creation failed!", "failed", str(e))
 
@@ -1121,10 +1235,12 @@ def main():
         person = person.drop_duplicates(subset=['person_id'])
 
         person.head()
+
         log_operation("person dataframe created succesfully!", "success")
     except Exception as e:
         log_error_report(e)
         log_operation("person dataframe creation failed!", "failed", str(e))
+        
 
     #agencies script block
     try:
@@ -1159,10 +1275,11 @@ def main():
     except Exception as e:
         log_error_report(e)
         log_operation("agencies dataframe creation failed!", "failed", str(e))
+        
 
     #logs script block
     try:
-        pf = extract_adsim_data(logs_url)
+        pf = dataframes[1]
         pf = ensure_columns(pf, needed_columns['historico'], drop_extra_columns=False)
 
         print(pf)
@@ -1177,6 +1294,7 @@ def main():
         # Combine IDs from both sources (removes duplicates automatically)
         correct_ids_combined = np.union1d(correct_ids_deals, correct_ids_df)
 
+
         # Filter `pf` to keep only rows with `main_id` in either DataFrame
         pf = pf[pf['main_id'].isin(correct_ids_combined)]
 
@@ -1187,6 +1305,7 @@ def main():
     except Exception as e:
         log_error_report(e)
         log_operation("logs data extraction failed!", "failed", str(e))
+        
 
     # Load matriz_equipes from Excel
     try:
@@ -1215,27 +1334,72 @@ def main():
     except Exception as e:
         log_error_report(e)
         log_operation("Failed to load matriz_equipes", "failed", str(e))
+        
 
     #excel script block
     try:
-        matriz_executivos = pd.read_excel(r'./xlsx_files/matriz_executivos.xlsx')
-        users = safe_merge(users, matriz_executivos, 'login', 'equipe_id', 'inner')
+        log_operation("Starting user sync from Google Sheet.", "info")
+            
+        # 1. Login to Google Sheets
+        gc = login()
+            
+        # 2. Fetch data from Google Sheet
+        spreadsheet_url = "https://docs.google.com/spreadsheets/d/1W_4JFszD1hfYjD9P-3oNL02a10kK-nMCR2ELNptR1Vc/edit?gid=0#gid=0"
+        sheet = gc.open_by_url(spreadsheet_url)
+        worksheet = sheet.get_worksheet(0)  # Getting first sheet
+        sheet_data = worksheet.get_all_records()
+        sheet_users_df = pd.DataFrame(sheet_data)
+
+        users = safe_merge(users, sheet_users_df, 'user_id', ['equipe_id'], merge_type='left')
+        # Cleaning to get only users with user_id
+        sheet_users_df.dropna(subset=['user_id'], inplace=True)
+        sheet_users_df = sheet_users_df[sheet_users_df['user_id'] != '']
+            
+        # Ensure sheet dataframe has the right columns and types
+        sheet_users_df = ensure_columns(sheet_users_df, expected_columns['users'], drop_extra_columns=True)
+        sheet_users_df = convert_columns_to_int(sheet_users_df, ['user_id', 'equipe_id'])
+        sheet_users_df.columns = sheet_users_df.columns.str.lower()
+
+        log_operation(f"Successfully fetched {len(sheet_users_df)} users from Google Sheet.", "success")
+
+        # 3. Fetch existing user IDs from the database
+        db_users_df = pd.read_sql_query("SELECT user_id FROM public.users", engine)
+            
+        # 4. Identify new users
+        if not db_users_df.empty:
+            existing_user_ids = set(db_users_df['user_id'])
+            new_users_df = sheet_users_df[~sheet_users_df['user_id'].isin(existing_user_ids)].copy()
+        else:
+            new_users_df = sheet_users_df.copy()
         
-        del matriz_executivos
-        log_operation("excel data fetched succesfully!", "success")
+
+        # 5. Insert new users into the database
+        if not new_users_df.empty:
+            log_operation(f"Found {len(new_users_df)} new users to insert from Google Sheet.", "info")
+            empty_update_df = pd.DataFrame(columns=new_users_df.columns)
+            user_columns_to_check = [col for col in expected_columns['users'] if col != 'user_id']
+                
+            update_or_insert_rows(conn, cursor, "users", "user_id", user_columns_to_check, empty_update_df, new_users_df)
+            log_operation(f"Finished inserting new users from Google Sheet.", "success")
+        else:
+            log_operation("No new users to insert from Google Sheet.", "info")
+
     except Exception as e:
         log_error_report(e)
-        log_operation("excel data fetch failed!", "failed", str(e))
+        log_operation("User sync from Google Sheet failed.", "failed", str(e))
+        
 
     #proposals script block
     try:
-        gf = extract_adsim_data(proposals_url)
+        gf = dataframes[2]
+        
 
         matriz_geotargets = pd.read_excel(r'./xlsx_files/IDS_TargetsDigital.xlsx')        
         log_operation("proposals and geotargets dataframes created succesfully!", "success")
     except Exception as e:
         log_error_report(e)
         log_operation("proposals and geotargets dataframe creation failed!", "failed", str(e))
+        
 
     #proposals_transforming script block
     try:
@@ -1245,7 +1409,6 @@ def main():
         gf_deals = ensure_columns(gf_deals, needed_columns['gf_deals'], drop_extra_columns=False)
         gf['main_id'] = gf_deals['id']
         gf = drop_columns(gf, columns_to_drop=['deal'])
-
         items = gf.explode('items')[['main_id', 'proposal_id', 'items']]
         items = pd.json_normalize(items.to_dict(orient='records'))
 
@@ -1320,7 +1483,7 @@ def main():
 
         items_digital = items_digital.rename(columns={'geotarget_name' : 'displayLocation_name', 'geotarget_initials' : 'displayLocation_initials', 'id' : 'item_id'})
         items_digital = items_digital.dropna(subset=['item_id'])
-        items_digital = safe_merge(items_digital, matriz_geotargets, 'displayLocations_initials', 'displayLocation_id', 'left')
+        items_digital = safe_merge(items_digital, matriz_geotargets, 'displayLocation_initials', 'displayLocation_id', 'left')
         items_digital = items_digital.reset_index(drop=True)
         gf = drop_columns(gf, columns_to_drop=['itemsDigital'])
 
@@ -1389,7 +1552,20 @@ def main():
         agencia_emails = agencia_emails.rename(columns={'agencia_id' : 'organization_id'})
         agencies = agencies.rename(columns={'agencia_id' : 'organization_id'})
         agencia_phoneNumbers = agencia_phoneNumbers.rename(columns={'agencia_id' : 'organization_id'})
-
+        
+        try:
+            agencies['stateRegistration'] = (
+                (agencies['stateRegistration'].notna()) &
+                (agencies['stateRegistration'].str.upper().str.strip().str.contains('S'))
+            )
+            
+            agencies['municipalRegistration'] = (
+                (agencies['municipalRegistration'].notna()) &
+                (agencies['municipalRegistration'].str.upper().str.strip().str.contains('S'))
+            )
+        except Exception as e:
+            log_operation("Waning: Bool convertion not performed!", "warning", str(e))
+        
         organization = pd.concat([agencies,organization], axis=0, ignore_index=True)
         organization_emails = pd.concat([agencia_emails,organization_emails], axis=0, ignore_index=True)
         organization_phoneNumbers = pd.concat([agencia_phoneNumbers,organization_phoneNumbers], axis=0, ignore_index=True)
@@ -1403,10 +1579,11 @@ def main():
     except Exception as e:
         log_error_report(e)
         log_operation("proposal dataframe cleaning failed!", "failed", str(e))
+        
 
     #activities script block
     try:
-        activities = extract_adsim_data(activities_url)
+        activities = dataframes[4]
         activities = ensure_columns(activities, needed_columns['activities'], drop_extra_columns=False)
         activities['startDate'] = pd.to_datetime(activities['startDate'])
         activities['endDate'] = pd.to_datetime(activities['endDate'])
@@ -1414,34 +1591,46 @@ def main():
 
         activities = activities.rename(columns={'userOwnerId' : 'user_id', 'dealId' : 'main_id'})
 
+        # Activities Organization Block
         try:
             activitiesOrg = pd.json_normalize(activities['organization'],sep='_')
-            activitiesPers = pd.json_normalize(activities['person'],sep='_')
-            activitiesComp = pd.json_normalize(activities['company'],sep='_')
-        except Exception as e:
-            log_error_report(e)
             activitiesOrg = pd.DataFrame()
+            activitiesOrg = ensure_columns(activitiesOrg, needed_columns['activitiestemp'], drop_extra_columns=False)
+            activities['organization_id'] = activitiesOrg['id']
+        except Exception as e:
+            log_operation("Warning: Failed to extract organization from activities", "warning", str(e))
+            
+        # Activities Person Block
+        try:
+            activitiesPers = pd.json_normalize(activities['person'],sep='_')
             activitiesPers = pd.DataFrame()
+            activitiesPers = ensure_columns(activitiesPers, needed_columns['activitiestemp'], drop_extra_columns=False)
+            activities['person_id'] = activitiesPers['id']
+        except Exception as e:
+            log_operation("Warning: Failed to extract person from activities", "warning", str(e))
+            
+        # Activities Company Block
+        try:
+            activitiesComp = pd.json_normalize(activities['company'],sep='_')
             activitiesComp = pd.DataFrame()
-
-        activitiesOrg = ensure_columns(activitiesOrg, needed_columns['activitiestemp'], drop_extra_columns=False)
-        activitiesPers = ensure_columns(activitiesPers, needed_columns['activitiestemp'], drop_extra_columns=False)
-        activitiesComp = ensure_columns(activitiesComp, needed_columns['activitiestemp'], drop_extra_columns=False)
+            activitiesComp = ensure_columns(activitiesComp, needed_columns['activitiestemp'], drop_extra_columns=False)
+            activities['company_id'] = activitiesComp['id']
+        except Exception as e:
+            log_operation("Warning: Failed to extract company from activities", "warning", str(e))
 
         try:
-            activities['organization_id'] = activitiesOrg['id']
-            activities['person_id'] = activitiesPers['id']
-            activities['company_id'] = activitiesComp['id']
-
-            activity_type = pd.json_normalize(activities['type'],sep='_')
-
-            activities['type_id'] = activity_type['id']
+            activity_type = pd.json_normalize(activities['type'],sep='_')            
+            if(activities.empty):
+                log_operation("activities dataframe is empty, skipping type extraction", "warning")
+            else:
+                activities['type_id'] = activity_type['id']
 
             activity_type = activity_type.drop_duplicates(subset=['id'])
             activity_type = activity_type.rename(columns={'id' : 'type_id'})
         except Exception as e:
             log_error_report(e)
             activity_type = pd.DataFrame()
+            
 
         activity_type = ensure_columns(activity_type, needed_columns['activitiestemp'], drop_extra_columns=False)
 
@@ -1466,25 +1655,96 @@ def main():
             activities['main_id'].isna()
         ]
 
-        del activities_checkin, activitiesComp, activitiesOrg, activitiesPers
-
+        try:
+            del activities_checkin, activitiesComp, activitiesOrg, activitiesPers
+        except Exception as e:
+            log_operation("Warning: One or more helper activities dataframe not found", "warning", str(e))
+        
         log_operation("activity and activity type dataframes created succesfully!", "success")
 
     except Exception as e:
         log_error_report(e)
         log_operation("activity and activity type dataframes creation failed!", "failed", str(e))
+        
 
     #sales script block
     try:
-        def fetch_sales_data(gc):
-            """Function to fetch sales data from Google Sheets."""
-            planilha = gc.open("VENDAS 2025 VERSÃO EUA")
-            aba = planilha.worksheet("sheet")
-            dados = aba.get_all_records()
-            return pd.DataFrame(dados)
+        def fetch_sales_data(gc, max_retries=3, cooldown_seconds=30):
+            """Function to fetch sales data from Google Sheets with retry on API errors."""
+            current_year = datetime.now().year
+            target_years = sorted({current_year - 1, current_year})
+            sales_frames = []
+
+            for target_year in target_years:
+                candidate_spreadsheets = [
+                    f"VENDAS {target_year} VERSÃO EUA",
+                    f"VENDAS {target_year} VERSAO EUA",
+                    f"VENDAS {target_year}",
+                ]
+
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        planilha = None
+                        for spreadsheet_name in candidate_spreadsheets:
+                            try:
+                                planilha = gc.open(spreadsheet_name)
+                                log_operation(f"Sales sheet found ({target_year}): {spreadsheet_name}", "info")
+                                break
+                            except gspread.SpreadsheetNotFound:
+                                continue
+
+                        if planilha is None:
+                            log_operation(
+                                f"Sales spreadsheet not found for year {target_year}. Tried: {candidate_spreadsheets}",
+                                "warning"
+                            )
+                            break  # no retry needed — sheet simply doesn't exist
+
+                        candidate_worksheets = ["Página1", "Pagina1", "sheet", "Sheet1"]
+                        aba = None
+                        for worksheet_name in candidate_worksheets:
+                            try:
+                                aba = planilha.worksheet(worksheet_name)
+                                log_operation(f"Sales worksheet found ({target_year}): {worksheet_name}", "info")
+                                break
+                            except gspread.WorksheetNotFound:
+                                continue
+
+                        if aba is None:
+                            aba = planilha.get_worksheet(0)
+                            log_operation(
+                                f"Sales worksheet fallback to first tab ({target_year}): {aba.title}",
+                                "warning"
+                            )
+
+                        dados = aba.get_all_records()
+                        df_year = pd.DataFrame(dados)
+                        if not df_year.empty:
+                            sales_frames.append(df_year)
+
+                        break  # success — no more retries needed for this year
+
+                    except gspread.exceptions.APIError as api_err:
+                        status_code = api_err.response.status_code if hasattr(api_err, 'response') else None
+                        if status_code in (429, 500, 502, 503) and attempt < max_retries:
+                            wait = cooldown_seconds * attempt
+                            log_operation(
+                                f"Google Sheets API error {status_code} for year {target_year} "
+                                f"(attempt {attempt}/{max_retries}). Retrying in {wait}s...",
+                                "warning",
+                                str(api_err)
+                            )
+                            time.sleep(wait)
+                        else:
+                            raise  # non-retryable or last attempt — propagate
+
+            if not sales_frames:
+                raise ValueError("Sales spreadsheets could not be loaded for current or previous year.")
+
+            return pd.concat(sales_frames, axis=0, ignore_index=True)
 
         gc = login()
-        timeout_seconds = 35
+        timeout_seconds = 120
 
         with futures.ThreadPoolExecutor() as executor:
             future = executor.submit(fetch_sales_data, gc)
@@ -1494,19 +1754,85 @@ def main():
             except futures.TimeoutError:
                 log_error_report(TimeoutError(f"Fetching sales data from Google Sheets timed out after {timeout_seconds} seconds."))
                 log_operation("sales dataframe creation failed due to timeout!", "failed", f"Timeout after {timeout_seconds} seconds")
-                vendas = pd.DataFrame() 
+                
+                vendas = pd.DataFrame()
+                
             except Exception as e:
                 log_error_report(e)
                 log_operation("sales dataframe creation failed!", "failed", str(e))
-                vendas = pd.DataFrame() 
+                
+                vendas = pd.DataFrame()
+                
     except Exception as e:
         log_error_report(e)
         log_operation("sales dataframe creation failed!", "failed", str(e))
+        
         vendas = pd.DataFrame() 
 
     #sales tranforming script block
     try:
+
+        def _normalize_sales_header(header_name):
+            normalized = unicodedata.normalize('NFKD', str(header_name).upper().strip())
+            normalized = normalized.encode('ASCII', 'ignore').decode('ASCII')
+            normalized = normalized.replace('_', ' ')
+            normalized = ' '.join(normalized.split())
+            return normalized
+
+        canonical_sales_headers = {
+            'PRACA': 'PRAÇA',
+            'REGIAO': 'REGIÃO',
+            'AREA DE NEGOCIO': 'AREA DE NEGÓCIO',
+            'MES/ANO': 'MÊS/ANO',
+            'NEGOCIO': 'NEGÓCIO',
+            'HISTORICO 2024': 'HISTÓRICO 2024',
+            'ID REMUNERACAO': 'ID REMUNERAÇÃO',
+        }
+
+        rename_sales_headers = {}
+        for current_col in vendas.columns:
+            canonical_col = canonical_sales_headers.get(_normalize_sales_header(current_col))
+            if canonical_col and canonical_col not in vendas.columns:
+                rename_sales_headers[current_col] = canonical_col
+
+        if rename_sales_headers:
+            vendas = vendas.rename(columns=rename_sales_headers)
+            log_operation(
+                f"Sales header normalization applied: {rename_sales_headers}",
+                "warning"
+            )
+
         vendas = ensure_columns(vendas, needed_columns['sales'], drop_extra_columns=False)
+
+        sales_aliases = {
+            'DESEMPENHO': 'PORCENTAGEM',
+            'HISTÓRICO_2024': 'HISTÓRICO 2024',
+            'HISTORICO_2024': 'HISTÓRICO 2024',
+            'ID REMUNERAÇÃO': 'ID REMUNERAÇÃO',
+            'ID REMUNERACAO': 'ID REMUNERAÇÃO',
+        }
+        for source_col, target_col in sales_aliases.items():
+            if target_col not in vendas.columns and source_col in vendas.columns:
+                vendas[target_col] = vendas[source_col]
+                log_operation(
+                    f"Sales column '{target_col}' was missing. Using alias '{source_col}'.",
+                    "warning"
+                )
+
+        if 'PLATAFORMA' not in vendas.columns:
+            plataforma_aliases = ['PLATAFORMA ', 'VEÍCULO', 'VEICULO', 'PRODUTO']
+            matched_alias = next((col for col in plataforma_aliases if col in vendas.columns), None)
+            if matched_alias:
+                vendas['PLATAFORMA'] = vendas[matched_alias]
+                log_operation(
+                    f"Sales column 'PLATAFORMA' was missing. Using alias '{matched_alias}'.",
+                    "warning"
+                )
+            else:
+                raise ValueError(
+                    f"Sales sheet is missing required column 'PLATAFORMA'. Available columns: {vendas.columns.tolist()}"
+                )
+
         users['EXECUTIVO'] = users['name'] + ' ' + users['lastname']
         users['EXECUTIVO'] = users['EXECUTIVO'].str.upper()
 
@@ -1556,11 +1882,49 @@ def main():
 
         users = users.drop_duplicates(subset=['user_id'])
         vendas['EXECUTIVO'] = vendas['EXECUTIVO'].str.strip()
-        vendas = safe_merge(vendas, users, 'EXECUTIVO', 'user_id', 'left')
+
+        # Use canonical users from DB (not limited in-memory API DF)
+        users_for_sales = pd.read_sql_query(
+            "SELECT user_id, name, lastname FROM users",
+            engine
+        )
+        users_for_sales['EXECUTIVO'] = (
+            users_for_sales['name'].fillna('') + ' ' + users_for_sales['lastname'].fillna('')
+        ).str.strip().str.upper()
+        users_for_sales = users_for_sales[['user_id', 'EXECUTIVO']]
+
+        # Normalized merge key for accent-insensitive matching
+        def _normalize_exec_key(value):
+            if pd.isna(value) or value is None:
+                return None
+            normalized = unicodedata.normalize('NFKD', str(value).strip().upper())
+            normalized = normalized.encode('ASCII', 'ignore').decode('ASCII')
+            normalized = ' '.join(normalized.split())
+            return normalized if normalized else None
+
+        vendas['exec_key'] = vendas['EXECUTIVO'].apply(_normalize_exec_key)
+        users_for_sales['exec_key'] = users_for_sales['EXECUTIVO'].apply(_normalize_exec_key)
+        users_for_sales = (
+            users_for_sales
+            .sort_values(by=['user_id'])
+            .drop_duplicates(subset=['exec_key'], keep='first')
+        )
+
+        vendas = safe_merge(vendas, users_for_sales, id_column='exec_key', columns_to_merge=['user_id'], merge_type='left')
+        vendas = drop_columns(vendas, ['exec_key'])
 
         users = drop_columns(users, columns_to_drop=['EXECUTIVO'])
 
         vendas = vendas.dropna(subset=['ID POWER BI'])
+
+        duplicated_power_bi = vendas['ID POWER BI'].duplicated(keep=False)
+        if duplicated_power_bi.any():
+            sample_duplicates = vendas.loc[duplicated_power_bi, ['ID POWER BI', 'PRAÇA', 'REGIÃO']].head(5).to_dict('records')
+            log_operation(
+                f"Sales sheet returned {duplicated_power_bi.sum()} rows sharing the same 'ID POWER BI'. Rebuilding IDs to prevent FK issues.",
+                "warning",
+                json.dumps(sample_duplicates, ensure_ascii=False)
+            )
 
         channels.loc[channels['channel_id'] == 1154, 'channel_id'] = 941
         channels.loc[channels['channel_id'] == 484, 'channel_id'] = 941
@@ -1580,28 +1944,111 @@ def main():
         dues.loc[dues['channel_id'] == 484, 'channel_id'] = 941
         channels.loc[channels['channel_id'] == 941, 'channel_name'] = 'TOPVIEW'
 
-        vendas.loc[vendas['PRAÇA'].str.contains('INSTITUC.'), 'PRAÇA'] = 'INSTITUCIONAL'
-        vendas.loc[vendas['user_id'] == 24436, 'PRAÇA'] = 'INSTITUCIONAL'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('GOV'), 'PLATAFORMA'] = vendas.loc[vendas['PLATAFORMA'].str.contains('GOV'), 'FONTE DE DADOS'].values
-        vendas.loc[vendas['PLATAFORMA'].str.contains('WTC'), 'PLATAFORMA'] = 'DIGITAL'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('RIC PODCAST'), 'PLATAFORMA'] = 'DIGITAL'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('RIC LAB'), 'PLATAFORMA'] = 'DIGITAL'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('JOY'), 'PLATAFORMA'] = 'JP CURITIBA'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('TV'), 'PLATAFORMA'] = 'RICTV RECORD'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('RÁDIO'), 'PLATAFORMA'] = 'JOVEM PAN PR'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('REVISTA'), 'PLATAFORMA'] = 'TOPVIEW'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('RICtv'), 'PLATAFORMA'] = 'RICTV RECORD'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('JP'), 'PLATAFORMA'] = 'JOVEM PAN PR'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('NEWS'), 'PLATAFORMA'] = 'JOVEM PAN NEWS PR'
-        vendas.loc[vendas['PLATAFORMA'].str.contains('DIGITAL'), 'PLATAFORMA'] = 'PORTAL ric.com.br'
+        vendas['PLATAFORMA'] = vendas['PLATAFORMA'].fillna('').astype(str).str.strip().str.upper()
+        vendas['FONTE DE DADOS'] = vendas['FONTE DE DADOS'].fillna('').astype(str).str.strip().str.upper()
 
+        vendas['PRAÇA'] = vendas['PRAÇA'].fillna('').astype(str).str.strip().str.upper()
+        vendas.loc[vendas['PRAÇA'].str.contains('INSTITUC', na=False), 'PRAÇA'] = 'INSTITUCIONAL'
+        vendas.loc[vendas['PRAÇA'].str.contains('DIGITAL DMSI', na=False), 'PRAÇA'] = 'INSTITUCIONAL'
+        vendas.loc[vendas['PRAÇA'].str.contains('ESP.*CEDIDO', na=False, regex=True), 'PRAÇA'] = 'INSTITUCIONAL'
+        vendas.loc[vendas['PRAÇA'].str.contains('PROGRAMATICA BANDA B|PROGRAMÁTICA BANDA B', na=False, regex=True), 'PRAÇA'] = 'BANDA B'
+        vendas.loc[vendas['user_id'] == 24436, 'PRAÇA'] = 'INSTITUCIONAL'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('GOV', na=False), 'PLATAFORMA'] = vendas.loc[vendas['PLATAFORMA'].str.contains('GOV', na=False), 'FONTE DE DADOS'].values
+        vendas.loc[vendas['PLATAFORMA'].str.contains('WTC', na=False), 'PLATAFORMA'] = 'DIGITAL'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('RIC PODCAST', na=False), 'PLATAFORMA'] = 'DIGITAL'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('RIC LAB', na=False), 'PLATAFORMA'] = 'DIGITAL'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('JOY', na=False), 'PLATAFORMA'] = 'JP CURITIBA'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('TV', na=False), 'PLATAFORMA'] = 'RICTV RECORD'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('RÁDIO', na=False), 'PLATAFORMA'] = 'JOVEM PAN PR'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('REVISTA', na=False), 'PLATAFORMA'] = 'TOPVIEW'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('RICtv', na=False), 'PLATAFORMA'] = 'RICTV RECORD'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('JP', na=False), 'PLATAFORMA'] = 'JOVEM PAN PR'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('NEWS', na=False), 'PLATAFORMA'] = 'JOVEM PAN NEWS PR'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('DIGITAL', na=False), 'PLATAFORMA'] = 'DIGITAL'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('OOH', na=False), 'PLATAFORMA'] = 'RIC OOH'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('BANDA B.*PORTAL|PORTAL.*BANDA B', na=False, regex=True), 'PLATAFORMA'] = 'PORTAL BANDA B'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('PORTAL', na=False), 'PLATAFORMA'] = 'DIGITAL'
+        vendas.loc[vendas['PLATAFORMA'].str.contains('GOV|ALEP', na=False, regex=True), 'PLATAFORMA'] = 'BANDA B'
+        
+        vendas = vendas.replace({"#ERROR!" : 0}) # REPLACE ALL ERRORS IN SHEET WITH 0
+        
         vendas['PLATAFORMA'] = vendas['PLATAFORMA'].str.strip()
-        channels['channel_name'] = channels['channel_name'].str.strip()
+
+        channels_for_sales = pd.read_sql_query(
+            "SELECT channel_id, channel_name FROM channels",
+            engine
+        )
+        channels_for_sales['channel_name'] = channels_for_sales['channel_name'].str.strip()
+        channels_for_sales.loc[channels_for_sales['channel_id'] == 941, 'channel_name'] = 'TOPVIEW'
+        channels_for_sales.loc[channels_for_sales['channel_id'] == 934, 'channel_name'] = 'DIGITAL'
         
         vendas = vendas.rename(columns={'PLATAFORMA' : 'channel_name', 'PRAÇA' : 'title'})
 
-        vendas = safe_merge(vendas, channels, id_column='channel_name', columns_to_merge=['channel_id'], merge_type='left')
-        vendas = safe_merge(vendas, pipeline, id_column='title', columns_to_merge=['pipeline_id'], merge_type='left')
+        def _normalize_merge_key(value):
+            if pd.isna(value) or value is None:
+                return None
+            normalized = unicodedata.normalize('NFKD', str(value).strip().upper())
+            normalized = normalized.encode('ASCII', 'ignore').decode('ASCII')
+            normalized = ' '.join(normalized.split())
+            return normalized if normalized else None
+
+        vendas['channel_key'] = vendas['channel_name'].apply(_normalize_merge_key)
+        channels_for_merge = channels_for_sales.copy()
+        channels_for_merge['channel_key'] = channels_for_merge['channel_name'].apply(_normalize_merge_key)
+        channels_for_merge = (
+            channels_for_merge
+            .sort_values(by=['channel_id'])
+            .drop_duplicates(subset=['channel_key'], keep='first')
+        )
+
+        vendas['title_key'] = vendas['title'].apply(_normalize_merge_key)
+
+        # Use canonical pipeline from DB (not limited in-memory API DF)
+        pipeline_for_sales = pd.read_sql_query(
+            "SELECT pipeline_id, title FROM pipeline",
+            engine
+        )
+        pipeline_for_merge = pipeline_for_sales.copy()
+        pipeline_for_merge['title_key'] = pipeline_for_merge['title'].apply(_normalize_merge_key)
+        pipeline_for_merge = (
+            pipeline_for_merge
+            .sort_values(by=['pipeline_id'])
+            .drop_duplicates(subset=['title_key'], keep='first')
+        )
+
+        vendas = safe_merge(vendas, channels_for_merge, id_column='channel_key', columns_to_merge=['channel_id'], merge_type='left')
+        vendas = safe_merge(vendas, pipeline_for_merge, id_column='title_key', columns_to_merge=['pipeline_id'], merge_type='left')
+        vendas = drop_columns(vendas, ['channel_key', 'title_key'])
+
+        id_components = ['ID POWER BI', 'PRAÇA', 'REGIÃO', 'AREA DE NEGÓCIO', 'NEGÓCIO', 'PLATAFORMA', 'EXECUTIVO', 'MÊS/ANO', 'ORIGEM', 'FONTE DE DADOS', 'user_id']
+        available_components = [col for col in id_components if col in vendas.columns]
+        missing_components = set(id_components) - set(available_components)
+        if missing_components:
+            log_operation(f"Sales ID build is missing columns: {missing_components}", "warning")
+        if not available_components:
+            raise ValueError("Unable to compose sales IDs because all source columns are missing.")
+
+        def _normalize_sales_component(value):
+            if pd.isna(value) or value == "":
+                return "NA"
+            normalized = str(value).strip()
+            return normalized.upper() if normalized else "NA"
+
+        vendas['_sales_composite_key'] = vendas[available_components].apply(
+            lambda row: "||".join(_normalize_sales_component(row[col]) for col in available_components),
+            axis=1
+        )
+        vendas['ID POWER BI'] = vendas['_sales_composite_key'].apply(
+            lambda key: hashlib.sha1(key.encode('utf-8')).hexdigest()
+        )
+
+        before_dedup = len(vendas)
+        vendas = vendas.drop_duplicates(subset=['ID POWER BI'], keep='first').reset_index(drop=True)
+        dropped_rows = before_dedup - len(vendas)
+        if dropped_rows:
+            log_operation(f"Removed {dropped_rows} duplicated sales rows before database load.", "info")
+
+        vendas = vendas.drop(columns=['_sales_composite_key'])
 
         vendas = drop_columns(vendas, columns_to_drop=['HISTÓRICO 2024', 'VIRADA', 'MÊS ANTERIOR', 'MÊS ATUAL X MÊS ANTERIOR', 
                                     'CRESCIMENTO 2025X2024', 'channel_name', 'title', 'EXECUTIVO', 'PREMIAÇÃO DIRETORIA GERAL', 'PREMIAÇÃO DIRETORIA DE PRAÇA', 
@@ -1617,6 +2064,7 @@ def main():
     except Exception as e:
         log_error_report(e)
         log_operation("sales dataframe transformation failed!", "failed", str(e))
+        
 
     #normalization script block
     try:
@@ -1646,6 +2094,7 @@ def main():
         #since we're fetching data from an api, it's best to ensure that values are what the database expects
         df = convert_columns_to_int(df, ['main_id', 'organization_id', 'dealType_id', 'person_id', 'agencies_id', 'products_id', 'pipeline_id', 
                                          'pipelineStep_id', 'creatorUser_id', 'responsible_id', 'company_id', 'activitiesQuantity', 'productsQuantity', 'sequenceOrder', ''])
+
         users = convert_columns_to_int(users, ['user_id', 'equipe_id'])
         organization = convert_columns_to_int(organization, ['organization_id', 'company_id', 'segment_id', 'portfolio_id'])
         dues = convert_columns_to_int(dues, ['dues_id', 'user_id', 'company_id', 'displayLocation_id', 'dealProposalItemId', 'channel_id', 'product_id'])
@@ -1681,7 +2130,6 @@ def main():
         organization.loc[organization['isAgency'] == None, 'isAgency'] = False
         organization.loc[organization['municipalRegistration'] == None, 'municipalRegistration'] = False
         organization.loc[organization['stateRegistration'] == None, 'stateRegistration'] = False
-
         dues.loc[dues['netValue'] == None, 'netValue'] = 0
         dues.loc[dues['value'] == None, 'value'] = 0   
 
@@ -1740,12 +2188,53 @@ def main():
         df.loc[df['islost'] == True, 'sequenceorder'] = 7
 
         vendas = vendas.dropna(subset=['id'])
+        duplicated_sales_ids = vendas['id'].duplicated().sum()
+        if duplicated_sales_ids > 0:
+            log_operation(f"Dropping {duplicated_sales_ids} duplicate sales IDs before sync.", "warning")
+            vendas = vendas.drop_duplicates(subset=['id'], keep='first')
+
 
         log_operation("dataframe normalized succesfully!", "success")
     except Exception as e:
         log_error_report(e)
         log_operation("dataframe normalization failed!", "failed", str(e))
+        
 
+    # Split Curitiba pipeline (Curitiba I and Curitiba II and TOPVIEW)
+    try:
+        filtered_users = users[( users['user_id'].isin(df.responsible_id.unique()) ) & ( users['equipe_id'].isin([4, 3]) )] 
+        filtered_users_topview = users[( users['user_id'].isin(df.responsible_id.unique()) ) & ( users['equipe_id'] == 5 )]
+        curitiba_mask = df['responsible_id'].isin(filtered_users['user_id'].values)
+        topview_mask = df['responsible_id'].isin(filtered_users_topview['user_id'].values)
+        
+        df.loc[curitiba_mask, 'pipeline_id'] = 2184
+        df.loc[topview_mask, 'pipeline_id'] = 3024
+
+        if 2184 not in pipeline['pipeline_id'].values:
+            new_pipeline = pipeline[pipeline['pipeline_id'] == 1077].copy()
+            new_pipeline['pipeline_id'] = 2184
+            new_pipeline['name'] = 'Curitiba 2'
+            pipeline = pd.concat([pipeline, new_pipeline], ignore_index=True)
+            
+            log_operation("Pipeline splitting for Curitiba completed", "success")
+        else:
+            log_operation("No deals found in Curitiba (1077)", "warning")
+
+        if 3024 not in pipeline['pipeline_id'].values:
+            new_pipeline_topview = pipeline[pipeline['pipeline_id'] == 1077].copy()
+            new_pipeline_topview['pipeline_id'] = 3024
+            new_pipeline_topview['name'] = 'TOPVIEW'
+            pipeline = pd.concat([pipeline, new_pipeline_topview], ignore_index=True)
+            
+            log_operation("Pipeline splitting for TOPVIEW completed", "success")
+            
+    
+    except Exception as e:
+        send_error_email("Erro em código ETL AdSim", e)
+        log_error_report(e)
+        log_operation("Spliting Curitiba pipeline failed!", "failed", str(e))
+        
+    
     try:
         # Establish connection
         conn = psycopg2.connect(
@@ -1759,6 +2248,59 @@ def main():
         
         # Create a cursor
         cursor = conn.cursor()
+        
+        # New Feature: Sync users from Google Sheet, checking if there's any new user not present in DB (public.users)
+        try:
+            log_operation("Starting user sync from Google Sheet.", "info")
+            
+            # 1. Login to Google Sheets
+            gc = login()
+            
+            # 2. Fetch data from Google Sheet
+            spreadsheet_url = "https://docs.google.com/spreadsheets/d/1W_4JFszD1hfYjD9P-3oNL02a10kK-nMCR2ELNptR1Vc/edit?gid=0#gid=0"
+            sheet = gc.open_by_url(spreadsheet_url)
+            worksheet = sheet.get_worksheet(0)  # Getting first sheet
+            sheet_data = worksheet.get_all_records()
+            sheet_users_df = pd.DataFrame(sheet_data)
+
+            # Cleaning to get only users with user_id
+            sheet_users_df.dropna(subset=['user_id'], inplace=True)
+            sheet_users_df = sheet_users_df[sheet_users_df['user_id'] != '']
+            
+            # Ensure sheet dataframe has the right columns and types
+            sheet_users_df = ensure_columns(sheet_users_df, expected_columns['users'], drop_extra_columns=True)
+            sheet_users_df = convert_columns_to_int(sheet_users_df, ['user_id', 'equipe_id'])
+            sheet_users_df.columns = sheet_users_df.columns.str.lower()
+
+            log_operation(f"Successfully fetched {len(sheet_users_df)} users from Google Sheet.", "success")
+
+            # 3. Fetch existing user IDs from the database
+            db_users_df = pd.read_sql_query("SELECT user_id FROM public.users", engine)
+            
+            # 4. Identify new users
+            if not db_users_df.empty:
+                existing_user_ids = set(db_users_df['user_id'])
+                new_users_df = sheet_users_df[~sheet_users_df['user_id'].isin(existing_user_ids)].copy()
+            else:
+                new_users_df = sheet_users_df.copy()
+
+            # 5. Insert new users into the database
+            if not new_users_df.empty:
+                log_operation(f"Found {len(new_users_df)} new users to insert from Google Sheet.", "info")
+                empty_update_df = pd.DataFrame(columns=new_users_df.columns)
+                user_columns_to_check = [col for col in expected_columns['users'] if col != 'user_id']
+                
+                update_or_insert_rows(conn, cursor, "users", "user_id", user_columns_to_check, empty_update_df, new_users_df)
+                log_operation(f"Finished inserting new users from Google Sheet.", "success")
+            else:
+                log_operation("No new users to insert from Google Sheet.", "info")
+
+        except Exception as e:
+            log_error_report(e)
+            log_operation("User sync from Google Sheet failed.", "failed", str(e))
+            
+            
+        # End of New Block
 
         table_mappings = {
         "teams": ("equipe_id", ['equipe_name'], matriz_equipes),
@@ -1799,41 +2341,104 @@ def main():
         "activities" : ("activity_id", ['main_id', 'organization_id', 'person_id', 'company_id', 'user_id', 'startdate', 'enddate', 'donedate', 'isdone', 
                                         'isallday', 'title', 'notes', 'checkin_date', 'checkin_latitude', 'checkin_longitude', 'type_id'], activities)
         }
+        
+        
+        # New function to compare database with google sheet and delete missing rows
+        def delete_missing_rows_from_db(conn, cursor, table_name, id_column, new_ids, max_deletion_ratio=0.7, year_scope=None):
+            """
+            Deletes rows from the database table that are not present in the new_ids list.
+            This is used to ensure the database matches the source of truth (e.g., Google Sheet).
+            """
+            if not new_ids:
+                log_operation(
+                    f"Skipping deletion in {table_name}: no valid IDs were provided from source.",
+                    "warning"
+                )
+                return
+
+            if year_scope and table_name == "sales":
+                scope_years = sorted({int(y) for y in year_scope if pd.notna(y)})
+                placeholders = ', '.join(['%s'] * len(scope_years))
+                db_ids_query = (
+                    f"SELECT {id_column} FROM {table_name} "
+                    f"WHERE EXTRACT(YEAR FROM mes_ano) IN ({placeholders})"
+                )
+                db_ids = pd.read_sql_query(db_ids_query, conn, params=tuple(scope_years))[id_column]
+            else:
+                db_ids = pd.read_sql_query(f"SELECT {id_column} FROM {table_name}", conn)[id_column]
+
+            db_ids_set = set(db_ids)
+            new_ids_set = set(new_ids)
+            ids_to_delete = db_ids_set - new_ids_set
+
+            if not db_ids_set:
+                return
+
+            deletion_ratio = len(ids_to_delete) / len(db_ids_set)
+            if deletion_ratio > max_deletion_ratio:
+                log_operation(
+                    f"Skipping deletion in {table_name}: would remove {len(ids_to_delete)} of {len(db_ids_set)} rows ({deletion_ratio:.1%}).",
+                    "warning"
+                )
+                return
+
+            if ids_to_delete:
+                placeholders = ', '.join(['%s'] * len(ids_to_delete))
+                delete_sql = f"DELETE FROM {table_name} WHERE {id_column} IN ({placeholders})"
+                cursor.execute(delete_sql, tuple(ids_to_delete))
+                conn.commit()
+                log_operation(f"Deleted {len(ids_to_delete)} rows from {table_name} that were removed from the Google Sheet.", "success")
 
         for table_name, (id_column, columns_to_check, new_data_df) in table_mappings.items():
             try:
-                # Check if the new data DataFrame is not empty and the ID column exists
-                if not new_data_df.empty and id_column in new_data_df.columns:
-                    # Get unique, non-null IDs from the new data
-                    ids_to_fetch = new_data_df[id_column].dropna().unique().tolist()
+                # For the sales table, fetch all rows to ensure deletions work correctly
+                if table_name == "sales":
+                    sql_data = pd.read_sql_query(f"SELECT * FROM {table_name}", engine)
+                    compare_and_update_table(cursor, conn, table_name, id_column, columns_to_check, sql_data, new_data_df)
 
-                    # If there are IDs to fetch, query only those rows
-                    if ids_to_fetch:
-                        # Use placeholders for security and efficiency
-                        placeholders = ', '.join(['%s'] * len(ids_to_fetch))
-                        sql_query = f"SELECT * FROM {table_name} WHERE {id_column} IN ({placeholders})"
-                        # Pass the list of IDs as parameters
-                        sql_data = pd.read_sql_query(sql_query, engine, params=tuple(ids_to_fetch))
-                        log_operation(f"Fetched {len(sql_data)} specific rows from {table_name} based on new data IDs.", "success")
-                    else:
-                        # No valid IDs in new data, fetch empty structure from DB
-                        log_operation(f"No valid IDs found in new data for {table_name}. Fetching empty structure.", "info")
-                        sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
+                    # Ensure DB matches sheet: delete any sales not present in the latest sheet
+                    if not new_data_df.empty and id_column in new_data_df.columns:
+                        new_ids = new_data_df[id_column].dropna().unique().tolist()
+                        year_scope = None
+                        if 'mes_ano' in new_data_df.columns:
+                            mes_ano_dt = pd.to_datetime(new_data_df['mes_ano'], errors='coerce')
+                            years = mes_ano_dt.dt.year.dropna().unique().tolist()
+                            year_scope = [int(y) for y in years if pd.notna(y)]
+
+                        delete_missing_rows_from_db(
+                            conn,
+                            cursor,
+                            table_name,
+                            id_column,
+                            new_ids,
+                            year_scope=year_scope
+                        )
                 else:
-                    # New data is empty or ID column missing, fetch empty structure
-                    log_operation(f"New data for {table_name} is empty or missing ID column '{id_column}'. Fetching empty structure.", "info")
-                    sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
-
-                # Proceed with comparison and update
-                compare_and_update_table(cursor, conn, table_name, id_column, columns_to_check, sql_data, new_data_df)
-                time.sleep(2) 
+                    # Existing logic for other tables
+                    if not new_data_df.empty and id_column in new_data_df.columns:
+                        ids_to_fetch = new_data_df[id_column].dropna().unique().tolist()
+                        if ids_to_fetch:
+                            placeholders = ', '.join(['%s'] * len(ids_to_fetch))
+                            sql_query = f"SELECT * FROM {table_name} WHERE {id_column} IN ({placeholders})"
+                            sql_data = pd.read_sql_query(sql_query, engine, params=tuple(ids_to_fetch))
+                            log_operation(f"Fetched {len(sql_data)} specific rows from {table_name} based on new data IDs.", "success")
+                        else:
+                            log_operation(f"No valid IDs found in new data for {table_name}. Fetching empty structure.", "info")
+                            sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
+                    else:
+                        log_operation(f"New data for {table_name} is empty or missing ID column '{id_column}'. Fetching empty structure.", "info")
+                        sql_data = pd.read_sql_query(f"SELECT * FROM {table_name} LIMIT 0", engine)
+                        
+                    compare_and_update_table(cursor, conn, table_name, id_column, columns_to_check, sql_data, new_data_df)
 
             except Exception as e:
                 log_error_report(e)
                 log_operation(f"Error processing table {table_name}.", "failed", str(e))
+                
 
         try:
             # Start a single transaction
+            
             with conn:
                 cursor.execute("""
                     -- Update 1: From displaylocations
@@ -1880,55 +2485,12 @@ def main():
                     AND d.channel_id IS NULL
                     AND pi2.isgroupingproduct = false
                     AND p.channel_id IS NOT NULL;
-                    
-                    -- Update 6: Delete duplicates (dues)
-                    WITH ranked_duplicates AS (
-                        SELECT *,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY channel_id, value, duedate, netvalue, paymentdate
-                                ORDER BY registerdate DESC
-                            ) AS rn
-                        FROM dues
-                    )
-
-                    DELETE FROM dues
-                    WHERE dues_id IN (
-                        SELECT dues_id
-                        FROM ranked_duplicates
-                        WHERE rn > 1
-                    );
-                                
-                    DELETE FROM basket_teste;
-                               
-                    -- Update 7: Delete Old Dues
-                    WITH ranked_dues AS (
-                        SELECT *,
-                            ROW_NUMBER() OVER (PARTITION BY main_id ORDER BY registerdate DESC) AS rn
-                        FROM dues
-                        WHERE main_id IN (
-                            SELECT a.main_id
-                            FROM (
-                                SELECT main_id, SUM(netvalue) AS total_netvalue
-                                FROM dues
-                                GROUP BY main_id
-                            ) AS a
-                            JOIN deals AS b ON a.main_id = b.main_id
-                            WHERE (a.total_netvalue - b.netvalue) >= 1
-                            AND b.iswon = true
-                            AND b.netvalue <> 0
-                        )
-                    )
-                    DELETE FROM dues
-                    WHERE (main_id, registerdate) IN (
-                        SELECT main_id, registerdate
-                        FROM ranked_dues
-                        WHERE rn > 1  -- Only delete if there are older records
-                    );
                 """)
             log_operation("All dues updates completed in single transaction", "success")
 
         except Exception as e:
             log_operation("Failed to update dues!", "failed", str(e))
+            
             log_error_report(e)
 
         try:
@@ -1998,14 +2560,31 @@ def main():
             log_operation("Inserted basket_teste", "success")
         except Exception as e:
             log_operation("Failed to update basket_teste!", "failed", str(e))
+            
             log_error_report(e)
 
+        
+        # Updating pipeline name in DB
+        with conn:
+            cursor.execute(
+                """
+                UPDATE public.pipeline
+                SET title = 'CURITIBA II'
+                WHERE pipeline_id = 2184;
+
+                UPDATE public.pipeline
+                SET title = 'TOPVIEW'
+                WHERE pipeline_id = 3024;
+                """
+            )
+        
         # Close connection
         cursor.close()
         conn.close()
     except Exception as e:
         conn.rollback()
         print("Error connecting to the database:", e)
+        
     
     save_report(report)
 
